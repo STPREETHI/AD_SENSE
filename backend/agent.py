@@ -1,14 +1,15 @@
 """
 Amazon Advertising & Sales Intelligence Agent.
-Uses Ollama (llama3) for query understanding and planning,
-then calls analytical tools and performs cross-dataset reasoning.
+Calls Gemini or Groq from the BACKEND using keys stored in .env
+Frontend never sees or handles any API keys.
 """
 
 import json
+import os
 import re
-import requests
-from typing import Optional
+import httpx
 import pandas as pd
+from typing import Optional
 
 from tools import (
     sales_trend_analyzer,
@@ -17,207 +18,359 @@ from tools import (
     action_recommender,
 )
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3"
+# ── Load provider config from environment ─────────────────────────────────────
+AI_PROVIDER   = os.getenv("AI_PROVIDER",   "gemini").lower()
+GEMINI_KEY    = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL  = os.getenv("GEMINI_MODEL",  "gemini-1.5-flash")
+GROQ_KEY      = os.getenv("GROQ_API_KEY",  "")
+GROQ_MODEL    = os.getenv("GROQ_MODEL",    "llama-3.3-70b-versatile")
 
+SYSTEM_PROMPT = """You are an expert Amazon advertising analyst.
+You have access to REAL data from an Amazon seller's account.
 
-def call_ollama(prompt: str, system: str = "") -> str:
-    """Call local Ollama LLM."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "system": system,
-        "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 800},
-    }
-    try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=60)
-        resp.raise_for_status()
-        return resp.json().get("response", "")
-    except Exception as e:
-        return f"[LLM unavailable: {str(e)}] Proceeding with rule-based analysis."
+Analyze the data carefully and answer the user's SPECIFIC question with precise numbers.
+Do NOT give generic answers — every response must reference specific keywords, ASINs, or metrics.
 
+RULES:
+1. Answer the SPECIFIC question asked — focus only on what was asked
+2. Use ACTUAL numbers from the provided data in every finding
+3. Connect ad data to sales outcomes (cross-dataset reasoning)
+4. Be direct, specific, and actionable
 
-def extract_asin_from_query(query: str, available_asins: list) -> Optional[str]:
-    """Extract ASIN from query if mentioned."""
-    query_upper = query.upper()
-    for asin in available_asins:
-        if asin.upper() in query_upper:
-            return asin
-    return None
-
-
-def parse_query_with_llm(query: str) -> dict:
-    """Use LLM to understand query intent and generate analysis plan."""
-    system = """You are an Amazon advertising analyst AI. 
-Analyze the user's query and return ONLY a JSON object with these fields:
+Return ONLY a valid JSON object with EXACTLY this structure (no markdown, no extra text):
 {
-  "intent": "one of: keyword_analysis|sales_trend|spend_efficiency|full_audit|what_if|comparison",
-  "focus": "keywords|products|both",
-  "asin_mentioned": "ASIN string or null",
-  "time_focus": "recent|specific|all",
-  "analysis_steps": ["step1", "step2", "step3"],
-  "summary": "one sentence description of what to analyze"
-}
-Return ONLY valid JSON, no other text."""
+  "query_understanding": "one sentence explaining what exactly you analyzed",
+  "analysis_steps": ["step1 with specific action taken", "step2", "step3", "step4"],
+  "key_findings": [
+    "Finding 1 with specific numbers from the data",
+    "Finding 2",
+    "Finding 3",
+    "Finding 4",
+    "Finding 5"
+  ],
+  "cross_dataset_insight": "2-3 sentences connecting ad performance to sales outcomes using specific numbers",
+  "recommendations": [
+    {
+      "action": "Specific action to take",
+      "reason": "Specific reason with numbers from data",
+      "confidence": "High|Medium|Low",
+      "expected_impact": "Specific expected outcome"
+    }
+  ],
+  "risk_warnings": ["Warning if critical risk found, else empty array"]
+}"""
 
-    response = call_ollama(query, system=system)
 
-    # Try to parse JSON from LLM response
+# ── AI Callers ────────────────────────────────────────────────────────────────
+
+async def call_gemini(user_prompt: str) -> str:
+    if not GEMINI_KEY:
+        raise ValueError("GEMINI_API_KEY not set in .env")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+    )
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": f"{SYSTEM_PROMPT}\n\n{user_prompt}"}]}],
+        "generationConfig": {
+            "temperature": 0.15,
+            "maxOutputTokens": 2000,
+            "responseMimeType": "application/json",
+        },
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json=body)
+        r.raise_for_status()
+        data = r.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def call_groq(user_prompt: str) -> str:
+    if not GROQ_KEY:
+        raise ValueError("GROQ_API_KEY not set in .env")
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    body = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": 0.15,
+        "max_tokens": 2000,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json=body, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+async def call_ai(user_prompt: str) -> dict:
+    """Route to configured AI provider and parse JSON response."""
+    if AI_PROVIDER == "groq":
+        raw = await call_groq(user_prompt)
+    else:
+        raw = await call_gemini(user_prompt)
+
+    # Strip markdown fences if any
+    clean = re.sub(r"```json\s*", "", raw)
+    clean = re.sub(r"```\s*",     "", clean).strip()
     try:
-        # Find JSON in response
-        match = re.search(r"\{.*\}", response, re.DOTALL)
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", clean, re.DOTALL)
         if match:
             return json.loads(match.group())
-    except Exception:
-        pass
-
-    # Fallback: rule-based parsing
-    query_lower = query.lower()
-    intent = "full_audit"
-    if any(w in query_lower for w in ["keyword", "acos", "converting", "conversion", "burn"]):
-        intent = "keyword_analysis"
-    elif any(w in query_lower for w in ["sales", "revenue", "dropped", "trend", "organic"]):
-        intent = "sales_trend"
-    elif any(w in query_lower for w in ["spend", "budget", "waste", "roi", "roas"]):
-        intent = "spend_efficiency"
-    elif any(w in query_lower for w in ["cut", "reduce", "20%", "plan"]):
-        intent = "what_if"
-
-    return {
-        "intent": intent,
-        "focus": "both",
-        "asin_mentioned": None,
-        "time_focus": "all",
-        "analysis_steps": [
-            "Analyze keyword performance and identify waste",
-            "Review sales trends and week-over-week changes",
-            "Calculate spend vs revenue and organic contribution",
-            "Generate prioritized recommendations",
-        ],
-        "summary": f"Performing {intent} analysis across all products",
-    }
+        raise ValueError(f"AI returned non-JSON response: {clean[:200]}")
 
 
-def synthesize_with_llm(query: str, tool_results: dict, plan: dict) -> dict:
-    """Use LLM to synthesize findings into a narrative insight."""
-    # Prepare compact summary for LLM
-    summary = {
-        "sales_trend": {
-            "total_revenue": tool_results.get("sales_trend", {}).get("total_revenue"),
-            "wow_change": tool_results.get("sales_trend", {}).get("revenue_wow_change_pct"),
-            "trend": tool_results.get("sales_trend", {}).get("trend_direction"),
-        },
-        "keyword_perf": {
-            "overall_acos": tool_results.get("keyword_performance", {}).get("overall_acos"),
-            "wasted_spend": tool_results.get("keyword_performance", {}).get("estimated_wasted_spend"),
-            "high_acos_count": tool_results.get("keyword_performance", {}).get("high_acos_count"),
-            "zero_conv_count": tool_results.get("keyword_performance", {}).get("zero_conv_count"),
-        },
-        "spend_vs_revenue": {
-            "ad_contribution_pct": tool_results.get("spend_vs_revenue", {}).get("ad_contribution_pct"),
-            "organic_pct": tool_results.get("spend_vs_revenue", {}).get("organic_contribution_pct"),
-            "overall_roi": tool_results.get("spend_vs_revenue", {}).get("overall_roi_pct"),
-        },
-    }
+# ── Data Summarizer ───────────────────────────────────────────────────────────
 
-    system = """You are an Amazon advertising expert. 
-Given analytical results, write a cross-dataset insight paragraph in plain English.
-Focus on connecting ad performance to sales outcomes.
-Be specific with numbers. Keep it under 150 words.
-Return ONLY the insight text, no JSON."""
-
-    prompt = f"""
-User query: {query}
-
-Analysis results: {json.dumps(summary, indent=2)}
-
-Write a cross-dataset business insight connecting these findings.
-"""
-
-    insight = call_ollama(prompt, system=system)
-
-    # Fallback insight if LLM unavailable
-    if "[LLM unavailable" in insight or not insight.strip():
-        ad_pct = summary["spend_vs_revenue"].get("ad_contribution_pct", 0) or 0
-        wow = summary["sales_trend"].get("wow_change", 0) or 0
-        acos = summary["keyword_perf"].get("overall_acos", 0) or 0
-        waste = summary["keyword_perf"].get("wasted_spend", 0) or 0
-
-        insight = (
-            f"Ad-attributed sales contribute {ad_pct:.1f}% of total revenue, "
-            f"with organic driving the remaining {100 - ad_pct:.1f}%. "
-            f"Overall ACoS stands at {acos:.1f}%, "
-            f"with an estimated ₹{waste:,.0f} in wasted spend on non-converting keywords. "
-            f"Week-over-week revenue has {'grown' if wow > 0 else 'declined'} by {abs(wow):.1f}%. "
-            f"Cross-referencing both datasets suggests the primary optimization opportunity lies in "
-            f"keyword-level bid management rather than overall budget changes."
-        )
-
-    return {"cross_dataset_insight": insight.strip()}
-
-
-def run_agent(query: str, sales_df: pd.DataFrame, ad_df: pd.DataFrame) -> dict:
+def build_data_summary(sales_df: pd.DataFrame, ad_df: pd.DataFrame,
+                        asin: Optional[str] = None) -> dict:
     """
-    Main agent entry point.
-    1. Parse query → plan
-    2. Call tools
-    3. Cross-dataset reasoning
-    4. Return structured JSON
+    Compute all key metrics from both dataframes and return a compact
+    structured summary to pass to the AI as context.
     """
-    # Step 1: Understand query
-    plan = parse_query_with_llm(query)
+    s = sales_df.copy()
+    a = ad_df.copy()
+    s["date"] = pd.to_datetime(s["date"])
+    a["date"] = pd.to_datetime(a["date"])
 
-    # Extract ASIN if mentioned
-    available_asins = list(sales_df["asin"].unique())
-    asin_filter = plan.get("asin_mentioned") or extract_asin_from_query(query, available_asins)
+    if asin:
+        s = s[s["asin"] == asin]
+        a = a[a["asin"] == asin]
 
-    analysis_steps = plan.get(
-        "analysis_steps",
-        [
-            "Parse query intent",
-            "Analyze sales trends",
-            "Evaluate keyword performance",
-            "Calculate spend vs revenue",
-            "Generate recommendations",
-        ],
+    # ── Sales metrics ─────────────────────────────────────────────────────────
+    total_revenue = float(s["revenue"].sum())
+    total_units   = int(s["units_sold"].sum())
+
+    max_date  = s["date"].max()
+    week_ago  = max_date - pd.Timedelta(days=7)
+    recent_rev = float(s[s["date"] > week_ago]["revenue"].sum())
+    prev_rev   = float(s[s["date"] <= week_ago]["revenue"].sum())
+    wow_change = ((recent_rev - prev_rev) / prev_rev * 100) if prev_rev > 0 else 0.0
+
+    top_products = (
+        s.groupby(["asin", "product_title"])
+         .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"))
+         .sort_values("revenue", ascending=False)
+         .head(5)
+         .reset_index()
+         .assign(revenue=lambda df: df["revenue"].round(0).astype(int),
+                 units=lambda df: df["units"].astype(int))
+         .to_dict(orient="records")
     )
 
-    # Step 2: Run all tools
-    sales_result = sales_trend_analyzer(sales_df, asin=asin_filter)
-    kw_result = keyword_performance_evaluator(ad_df, asin=asin_filter)
-    svr_result = spend_vs_revenue_calculator(ad_df, sales_df, asin=asin_filter)
+    # ── Ad metrics ────────────────────────────────────────────────────────────
+    total_spend  = float(a["ad_spend"].sum())
+    total_attr   = float(a["attributed_sales"].sum())
+    total_clicks = int(a["clicks"].sum())
+    total_impr   = int(a["impressions"].sum())
+    total_attr_u = int(a["attributed_units"].sum())
 
-    tool_results = {
-        "sales_trend": sales_result,
-        "keyword_performance": kw_result,
-        "spend_vs_revenue": svr_result,
+    overall_acos = (total_spend / total_attr * 100) if total_attr > 0 else 999.0
+    overall_roas = (total_attr / total_spend)        if total_spend > 0 else 0.0
+    ctr  = (total_clicks / total_impr  * 100) if total_impr   > 0 else 0.0
+    cvr  = (total_attr_u / total_clicks * 100) if total_clicks > 0 else 0.0
+    avg_cpc = total_spend / total_clicks if total_clicks > 0 else 0.0
+
+    # ── Keyword-level aggregation ─────────────────────────────────────────────
+    kw = (
+        a.groupby(["asin", "keyword", "match_type"])
+         .agg(
+             spend=("ad_spend", "sum"),
+             attr_sales=("attributed_sales", "sum"),
+             attr_units=("attributed_units", "sum"),
+             clicks=("clicks", "sum"),
+             impressions=("impressions", "sum"),
+         )
+         .reset_index()
+    )
+    kw["acos"] = kw.apply(
+        lambda r: round(r["spend"] / r["attr_sales"] * 100, 1)
+                  if r["attr_sales"] > 0 else 999.0, axis=1
+    )
+    kw["roas"] = kw.apply(
+        lambda r: round(r["attr_sales"] / r["spend"], 2)
+                  if r["spend"] > 0 else 0.0, axis=1
+    )
+    kw["ctr"] = kw.apply(
+        lambda r: round(r["clicks"] / r["impressions"] * 100, 2)
+                  if r["impressions"] > 0 else 0.0, axis=1
+    )
+    kw["cvr"] = kw.apply(
+        lambda r: round(r["attr_units"] / r["clicks"] * 100, 2)
+                  if r["clicks"] > 0 else 0.0, axis=1
+    )
+
+    high_acos = kw[(kw["acos"] > 70) & (kw["spend"] > 50)].sort_values("spend", ascending=False)
+    zero_conv = kw[(kw["clicks"] > 5) & (kw["attr_units"] == 0)].sort_values("spend", ascending=False)
+    top_roas  = kw[kw["roas"] > 0].sort_values("roas", ascending=False).head(8)
+    top_spend = kw.sort_values("spend", ascending=False).head(8)
+    wasted    = float(high_acos["spend"].sum()) + float(zero_conv["spend"].sum())
+
+    def kw_records(frame, cols, n=8):
+        return (frame[cols].head(n)
+                .round(2)
+                .to_dict(orient="records"))
+
+    cols = ["asin", "keyword", "match_type", "spend", "attr_sales", "acos", "roas", "ctr", "cvr"]
+
+    # ── Match type breakdown ──────────────────────────────────────────────────
+    match_breakdown = (
+        a.groupby("match_type")
+         .agg(spend=("ad_spend","sum"), attr=("attributed_sales","sum"), clicks=("clicks","sum"))
+         .reset_index()
+         .assign(
+             acos=lambda df: (df["spend"] / df["attr"] * 100).where(df["attr"] > 0, 999).round(1),
+             roas=lambda df: (df["attr"] / df["spend"]).where(df["spend"] > 0, 0).round(2),
+         )
+         .to_dict(orient="records")
+    )
+
+    # ── Per-ASIN ad performance ───────────────────────────────────────────────
+    asin_perf = (
+        a.groupby("asin")
+         .agg(spend=("ad_spend","sum"), attr=("attributed_sales","sum"), clicks=("clicks","sum"))
+         .reset_index()
+         .assign(
+             roas=lambda df: (df["attr"] / df["spend"]).where(df["spend"] > 0, 0).round(2),
+             acos=lambda df: (df["spend"] / df["attr"] * 100).where(df["attr"] > 0, 999).round(1),
+         )
+         .sort_values("roas", ascending=False)
+         .head(6)
+         .to_dict(orient="records")
+    )
+
+    organic_rev   = max(0.0, total_revenue - total_attr)
+    ad_contrib    = (total_attr / total_revenue * 100) if total_revenue > 0 else 0.0
+
+    return {
+        "sales": {
+            "total_revenue": round(total_revenue, 0),
+            "total_units": total_units,
+            "revenue_wow_change_pct": round(wow_change, 1),
+            "trend": "UP" if wow_change > 2 else ("DOWN" if wow_change < -2 else "STABLE"),
+            "date_range": {
+                "start": str(s["date"].min().date()),
+                "end":   str(s["date"].max().date()),
+            },
+            "organic_revenue": round(organic_rev, 0),
+            "ad_contribution_pct": round(ad_contrib, 1),
+            "organic_contribution_pct": round(100 - ad_contrib, 1),
+            "top_products": top_products,
+        },
+        "ads": {
+            "total_spend": round(total_spend, 0),
+            "total_attributed_sales": round(total_attr, 0),
+            "total_clicks": total_clicks,
+            "total_impressions": total_impr,
+            "overall_acos_pct": round(overall_acos, 1),
+            "overall_roas": round(overall_roas, 2),
+            "avg_ctr_pct": round(ctr, 2),
+            "avg_cvr_pct": round(cvr, 2),
+            "avg_cpc": round(avg_cpc, 2),
+            "wasted_spend_estimate": round(wasted, 0),
+            "high_acos_keyword_count": int(len(high_acos)),
+            "zero_conversion_keyword_count": int(len(zero_conv)),
+            "high_acos_keywords": kw_records(high_acos, cols),
+            "zero_conversion_keywords": kw_records(zero_conv, cols),
+            "top_roas_keywords": kw_records(top_roas, cols),
+            "top_spend_keywords": kw_records(top_spend, cols),
+            "match_type_breakdown": match_breakdown,
+            "top_roas_asins": asin_perf,
+        },
+        "combined": {
+            "total_revenue": round(total_revenue, 0),
+            "organic_revenue": round(organic_rev, 0),
+            "ad_attributed_revenue": round(total_attr, 0),
+            "ad_contribution_pct": round(ad_contrib, 1),
+            "organic_contribution_pct": round(100 - ad_contrib, 1),
+            "overall_acos_pct": round(overall_acos, 1),
+            "overall_roas": round(overall_roas, 2),
+            "spend_to_revenue_pct": round(
+                total_spend / total_revenue * 100 if total_revenue > 0 else 0, 1
+            ),
+        },
     }
 
-    # Step 3: Action recommendations
+
+# ── Main Agent Entry Point ────────────────────────────────────────────────────
+
+async def run_agent(query: str,
+                    sales_df: pd.DataFrame,
+                    ad_df: pd.DataFrame) -> dict:
+    """
+    1. Build data summary from both CSVs
+    2. Run rule-based tools for structured metrics
+    3. Call AI with query + data → get structured JSON response
+    4. Merge AI response with tool outputs and return
+    """
+    # Extract ASIN mention if any
+    all_asins = list(sales_df["asin"].unique())
+    mentioned_asin = next(
+        (a for a in all_asins if a.upper() in query.upper()), None
+    )
+
+    # Build comprehensive data summary
+    data_summary = build_data_summary(sales_df, ad_df, asin=mentioned_asin)
+
+    # Also run rule-based tools for fallback metrics
+    sales_result = sales_trend_analyzer(sales_df, asin=mentioned_asin)
+    kw_result    = keyword_performance_evaluator(ad_df, asin=mentioned_asin)
+    svr_result   = spend_vs_revenue_calculator(ad_df, sales_df, asin=mentioned_asin)
+    tool_results = {
+        "sales_trend":         sales_result,
+        "keyword_performance": kw_result,
+        "spend_vs_revenue":    svr_result,
+    }
     rec_result = action_recommender(tool_results)
 
-    # Step 4: LLM synthesis
-    synthesis = synthesize_with_llm(query, tool_results, plan)
+    # Build user prompt for AI
+    user_prompt = (
+        f'User Question: "{query}"\n\n'
+        f"REAL DATA FROM THE SELLER'S ACCOUNT:\n"
+        f"{json.dumps(data_summary, indent=2, ensure_ascii=True)}\n\n"
+        f"Answer the user's specific question using ONLY this real data. "
+        f"Include specific keyword names, ASIN codes, and exact amounts in your response."
+    )
 
-    # Step 5: Build final response
-    return {
-        "query_understanding": plan.get("summary", query),
-        "analysis_steps": analysis_steps,
-        "key_findings": [
-            f"Total Revenue: ₹{sales_result.get('total_revenue', 0):,.2f}",
-            f"Revenue Trend: {sales_result.get('trend_direction', 'N/A').upper()} "
-            f"({sales_result.get('revenue_wow_change_pct', 0):+.1f}% WoW)",
-            f"Overall ACoS: {kw_result.get('overall_acos', 0):.1f}%",
-            f"Wasted Ad Spend: ₹{kw_result.get('estimated_wasted_spend', 0):,.2f}",
-            f"High-ACoS Keywords: {kw_result.get('high_acos_count', 0)}",
-            f"Zero-Conversion Keywords: {kw_result.get('zero_conv_count', 0)}",
-            f"Ad vs Organic Split: {svr_result.get('ad_contribution_pct', 0):.1f}% / "
-            f"{svr_result.get('organic_contribution_pct', 0):.1f}%",
-            f"Ad ROI: {svr_result.get('overall_roi_pct', 0):.1f}%",
-        ],
-        "cross_dataset_insight": synthesis["cross_dataset_insight"],
-        "recommendations": rec_result["recommendations"],
-        "risk_warnings": rec_result["risk_warnings"],
-        "raw_tool_outputs": tool_results,
-    }
+    # Call AI (Gemini or Groq based on .env)
+    try:
+        ai_response = await call_ai(user_prompt)
+    except Exception as e:
+        # Graceful fallback to rule-based if AI is unavailable
+        ai_response = {
+            "query_understanding": f"Rule-based analysis for: {query}",
+            "analysis_steps": sales_result.get("analysis_steps", [
+                "Parsed query intent",
+                "Analyzed keyword performance",
+                "Computed spend vs revenue",
+                "Generated rule-based recommendations",
+            ]),
+            "key_findings": [
+                f"Total Revenue: Rs.{data_summary['sales']['total_revenue']:,.0f}",
+                f"Revenue Trend: {data_summary['sales']['trend']} ({data_summary['sales']['revenue_wow_change_pct']:+.1f}% WoW)",
+                f"Overall ACoS: {data_summary['ads']['overall_acos_pct']}%",
+                f"Overall ROAS: {data_summary['ads']['overall_roas']}x",
+                f"Wasted Ad Spend: Rs.{data_summary['ads']['wasted_spend_estimate']:,.0f}",
+                f"High-ACoS Keywords: {data_summary['ads']['high_acos_keyword_count']}",
+                f"Zero-Conversion Keywords: {data_summary['ads']['zero_conversion_keyword_count']}",
+                f"Ad vs Organic: {data_summary['combined']['ad_contribution_pct']}% / {data_summary['combined']['organic_contribution_pct']}%",
+            ],
+            "cross_dataset_insight": (
+                f"AI provider unavailable ({e}). Rule-based insight: "
+                f"Ad-attributed sales contribute {data_summary['combined']['ad_contribution_pct']}% of total revenue. "
+                f"Overall ACoS is {data_summary['ads']['overall_acos_pct']}% with approximately "
+                f"Rs.{data_summary['ads']['wasted_spend_estimate']:,.0f} in estimated wasted spend."
+            ),
+            "recommendations": rec_result.get("recommendations", []),
+            "risk_warnings": rec_result.get("risk_warnings", []),
+        }
+
+    # Attach raw tool outputs for the what-if simulator
+    ai_response["raw_tool_outputs"] = tool_results
+    return ai_response
