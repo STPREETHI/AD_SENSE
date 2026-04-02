@@ -11,6 +11,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 # Load .env before anything else
 load_dotenv()
@@ -20,15 +22,16 @@ from models import QueryRequest
 
 app = FastAPI(title="Amazon Ad & Sales Intelligence Agent", version="2.0.0")
 
-# CORS — restrict to configured origins in production
+# CORS — allow null origin for local file:// dev + configured origins
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:5500,http://127.0.0.1:5500"
+    "http://localhost:3000,http://localhost:5500,http://127.0.0.1:5500,"
+    "http://localhost:8000,http://127.0.0.1:8000"
 ).split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*", "null"],   # "null" covers requests from file:// pages
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
@@ -36,6 +39,9 @@ app.add_middleware(
 # In-memory data store
 DATA_STORE: dict = {"sales_df": None, "ad_df": None}
 DATA_DIR = Path(__file__).parent / "data"
+
+# ── Serve frontend from /  ────────────────────────────────────────────────────
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
 
 def load_default_data():
@@ -53,6 +59,10 @@ async def startup():
     provider = os.getenv("AI_PROVIDER", "gemini")
     key_set  = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GROQ_API_KEY"))
     print(f"AI provider: {provider} | Key configured: {key_set}")
+    if FRONTEND_DIR.exists():
+        print(f"Frontend served at http://localhost:8000/  ({FRONTEND_DIR})")
+    else:
+        print(f"WARNING: Frontend directory not found at {FRONTEND_DIR}")
 
 
 def get_dataframes():
@@ -64,9 +74,10 @@ def get_dataframes():
     return DATA_STORE["sales_df"], DATA_STORE["ad_df"]
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── API Endpoints (must be defined BEFORE the static mount) ──────────────────
 
-@app.get("/")
+@app.get("/api/status")
+@app.get("/status")
 def root():
     provider = os.getenv("AI_PROVIDER", "gemini")
     key_ok   = bool(os.getenv("GEMINI_API_KEY") if provider == "gemini"
@@ -78,6 +89,12 @@ def root():
         "data_loaded":  DATA_STORE["sales_df"] is not None,
         "endpoints":    ["/upload", "/query", "/metrics"],
     }
+
+
+# Keep the old root for backward compat (returns JSON, not the page)
+@app.get("/status")
+def status():
+    return root()
 
 
 @app.post("/upload")
@@ -117,11 +134,6 @@ async def upload_files(
 
 @app.post("/query")
 async def query_agent(request: QueryRequest):
-    """
-    Natural language query endpoint.
-    The backend calls Gemini/Groq using keys from .env.
-    The frontend sends only the query text — no API keys involved.
-    """
     sales_df, ad_df = get_dataframes()
     try:
         result = await run_agent(request.query, sales_df, ad_df)
@@ -153,12 +165,10 @@ async def get_metrics():
         cvr              = (total_attr_units / total_clicks * 100) if total_clicks > 0 else 0.0
         avg_cpc          = total_spend / total_clicks if total_clicks > 0 else 0.0
 
-        # Profit
         profit_rows = sales_df[sales_df["profit_margin_pct"].notna() & (sales_df["profit_margin_pct"] > 0)]
         avg_margin  = (profit_rows["profit_margin_pct"].mean() / 100) if len(profit_rows) > 0 else 0.20
         total_profit = total_revenue * avg_margin - total_spend
 
-        # Wasted spend
         kw = (
             ad_df.groupby(["asin", "keyword"])
                  .agg(clicks=("clicks","sum"), attr_units=("attributed_units","sum"),
@@ -167,7 +177,6 @@ async def get_metrics():
         )
         wasted = float(kw[(kw["clicks"] > 0) & (kw["attr_units"] == 0)]["spend"].sum())
 
-        # Top ASINs
         top_asins = (
             sales_df.groupby(["asin", "product_title"])
                     .agg(revenue=("revenue","sum"), units=("units_sold","sum"))
@@ -177,7 +186,6 @@ async def get_metrics():
                     .to_dict(orient="records")
         )
 
-        # Daily trends (last 30 days)
         daily = (
             sales_df.groupby("date")
                     .agg(revenue=("revenue","sum"), units=("units_sold","sum"))
@@ -224,7 +232,6 @@ async def get_metrics():
 
 @app.get("/config")
 def config_status():
-    """Shows which AI provider is active — never exposes the actual key."""
     provider = os.getenv("AI_PROVIDER", "gemini")
     return {
         "ai_provider":    provider,
@@ -234,3 +241,9 @@ def config_status():
             else os.getenv("GROQ_API_KEY")
         ),
     }
+
+
+# ── Serve frontend static files — MUST be mounted AFTER all API routes ────────
+# Access the UI at: http://localhost:8000
+if FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

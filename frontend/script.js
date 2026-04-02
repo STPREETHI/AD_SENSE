@@ -2,9 +2,16 @@
    AdSense AI — Frontend Script
    Architecture: Frontend -> FastAPI backend -> AI provider
    API keys live in .env on the server. Never in the browser.
+
+   Open the app at: http://localhost:8000
+   (served by FastAPI — do NOT open index.html directly)
    ========================================================= */
 
-const API = 'http://localhost:8000';
+// Auto-detect: if opened as a local file, hit the backend directly.
+// If served by FastAPI at http://localhost:8000, use relative paths.
+const API = window.location.protocol === 'file:'
+  ? 'http://localhost:8000'
+  : '';
 
 let revenueChart = null;
 let spendChart   = null;
@@ -21,12 +28,11 @@ async function checkBackend() {
   const statusEl  = document.getElementById('backend-status');
   const dataEl    = document.getElementById('data-status');
   try {
-    const r = await fetch(`${API}/`);
+    const r = await fetch(`${API}/status`);
     const d = await r.json();
     statusEl.textContent = 'API Online';
     statusEl.className   = 'status-pill status-ok';
 
-    // Show AI config from backend
     loadAIConfig();
 
     if (d.data_loaded) {
@@ -51,11 +57,10 @@ async function loadAIConfig() {
       keyEl.textContent = d.api_key_set ? 'Configured' : 'NOT SET';
       keyEl.style.color = d.api_key_set ? 'var(--green)' : 'var(--red)';
     }
-    // Update agent badge
     const badge = document.getElementById('agent-model-badge');
     if (badge && d.model) badge.textContent = `${d.ai_provider} / ${d.model}`;
   } catch {
-    // Backend may not have /config yet — ignore
+    // ignore
   }
 }
 
@@ -110,12 +115,10 @@ async function uploadFiles() {
   showMsg(msg, 'Uploading...', '');
 
   try {
-    // Parse locally for charts and simulator
     const [salesText, adsText] = await Promise.all([salesFile.text(), adsFile.text()]);
     salesData = parseCSV(salesText);
     adsData   = parseCSV(adsText);
 
-    // Send to backend (which holds the data for AI queries)
     const fd = new FormData();
     fd.append('sales_file', salesFile);
     fd.append('ads_file',   adsFile);
@@ -142,7 +145,7 @@ async function loadMetrics() {
     const r = await fetch(`${API}/metrics`);
     const d = await r.json();
     if (d.total_revenue) renderKPIsFromBackend(d);
-  } catch { /* ignore — will render from client-side parse on upload */ }
+  } catch { /* ignore */ }
 }
 
 function computeAndRenderAll() {
@@ -230,7 +233,6 @@ function renderKPIsFromBackend(d) {
 
 /* ── Charts ──────────────────────────────────────────────────────────── */
 function renderCharts() {
-  // Daily revenue
   const salesByDate = {};
   salesData.forEach(r => {
     const d = (r.date || '').slice(0, 10);
@@ -239,7 +241,6 @@ function renderCharts() {
   const revDates = Object.keys(salesByDate).sort().slice(-30);
   const revVals  = revDates.map(d => salesByDate[d]);
 
-  // Daily spend & attributed
   const spendByDate = {};
   const attrByDate  = {};
   adsData.forEach(r => {
@@ -316,7 +317,7 @@ function renderTopProducts() {
     </table>`;
 }
 
-/* ── Agent Query — calls backend, backend calls AI ────────────────────── */
+/* ── Agent Query ──────────────────────────────────────────────────────── */
 function setQuery(text) { document.getElementById('queryInput').value = text; }
 
 async function runQuery() {
@@ -329,7 +330,6 @@ async function runQuery() {
   document.getElementById('agent-error').classList.add('hidden');
   document.getElementById('agent-loading').classList.remove('hidden');
 
-  // Animate loading steps
   const steps = [...document.querySelectorAll('.loading-step')];
   steps.forEach(s => s.className = 'loading-step');
   let idx = 0;
@@ -340,7 +340,6 @@ async function runQuery() {
   }, 900);
 
   try {
-    // Just send the text query — backend handles all AI API calls
     const r = await fetch(`${API}/query`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -420,7 +419,7 @@ function runWhatIf() {
 
   const savings    = totalSpend * (pct / 100);
   const newSpend   = totalSpend - savings;
-  const attrDrop   = totalAttr * (pct / 100) * 0.70;   // 70% proportional drop
+  const attrDrop   = totalAttr * (pct / 100) * 0.70;
   const newTotal   = organicRev + (totalAttr - attrDrop);
   const revImpact  = totalRevenue - newTotal;
   const netGain    = savings - revImpact;
@@ -446,7 +445,6 @@ function runWhatIf() {
 }
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
-// Use ASCII Rs. prefix to avoid encoding issues with the Rupee symbol
 function fmtINR(n) {
   if (n === undefined || n === null) return '-';
   return 'Rs.' + Math.round(Number(n)).toLocaleString('en-IN');
