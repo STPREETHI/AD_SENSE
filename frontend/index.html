@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AdSense — Amazon Intelligence Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- ─── Header ─────────────────────────────────────────────────────── -->
+<header class="header">
+  <div class="header-inner">
+    <div class="logo">
+      <span class="logo-mark">⬡</span>
+      <span class="logo-text">AdSense<sup>AI</sup></span>
+    </div>
+    <div class="header-status">
+      <span id="data-status" class="status-pill status-warning">No data loaded</span>
+      <span class="status-pill status-info" id="backend-status">Connecting…</span>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ─── Sidebar ──────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <section class="panel">
+      <h3 class="panel-title">DATA UPLOAD</h3>
+      <label class="file-label" for="salesFile">
+        <span class="file-icon">📊</span>
+        <span id="salesLabel">Sales CSV</span>
+        <input type="file" id="salesFile" accept=".csv" hidden />
+      </label>
+      <label class="file-label" for="adsFile">
+        <span class="file-icon">🎯</span>
+        <span id="adsLabel">Ads CSV</span>
+        <input type="file" id="adsFile" accept=".csv" hidden />
+      </label>
+      <button class="btn-primary" id="uploadBtn" onclick="uploadFiles()">Upload &amp; Analyze</button>
+      <div id="upload-msg" class="msg"></div>
+    </section>
+
+    <section class="panel">
+      <h3 class="panel-title">SAMPLE QUERIES</h3>
+      <div class="sample-queries">
+        <button class="sample-q" onclick="setQuery(this.textContent)">Which keywords are burning my budget without converting?</button>
+        <button class="sample-q" onclick="setQuery(this.textContent)">Is my sales drop an ad issue or organic demand?</button>
+        <button class="sample-q" onclick="setQuery(this.textContent)">Give me a plan to cut ad waste by 20% without hurting sales</button>
+        <button class="sample-q" onclick="setQuery(this.textContent)">What is my best performing campaign and why?</button>
+        <button class="sample-q" onclick="setQuery(this.textContent)">Show full audit of all products</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3 class="panel-title">WHAT-IF SIMULATOR</h3>
+      <label class="sim-label">Reduce ad spend by <span id="sim-pct-val">20</span>%</label>
+      <input type="range" id="sim-slider" min="5" max="50" value="20" class="slider" oninput="updateSimLabel(this.value)" />
+      <button class="btn-secondary" onclick="runWhatIf()">Run Simulation</button>
+      <div id="sim-result" class="sim-output"></div>
+    </section>
+  </aside>
+
+  <!-- ─── Main Content ──────────────────────────────────────────────── -->
+  <div class="content">
+
+    <!-- KPI Cards -->
+    <section class="kpi-row" id="kpi-row">
+      <div class="kpi-card" id="kpi-revenue">
+        <div class="kpi-label">TOTAL REVENUE</div>
+        <div class="kpi-value" id="kpi-rev-val">—</div>
+        <div class="kpi-sub" id="kpi-rev-sub"></div>
+      </div>
+      <div class="kpi-card" id="kpi-spend">
+        <div class="kpi-label">AD SPEND</div>
+        <div class="kpi-value" id="kpi-spend-val">—</div>
+        <div class="kpi-sub" id="kpi-spend-sub"></div>
+      </div>
+      <div class="kpi-card" id="kpi-acos">
+        <div class="kpi-label">OVERALL ACoS</div>
+        <div class="kpi-value" id="kpi-acos-val">—</div>
+        <div class="kpi-sub">Target: &lt;30%</div>
+      </div>
+      <div class="kpi-card" id="kpi-profit">
+        <div class="kpi-label">EST. PROFIT</div>
+        <div class="kpi-value" id="kpi-profit-val">—</div>
+        <div class="kpi-sub" id="kpi-profit-sub"></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">UNITS SOLD</div>
+        <div class="kpi-value" id="kpi-units-val">—</div>
+        <div class="kpi-sub">All products</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">ORGANIC REV</div>
+        <div class="kpi-value" id="kpi-organic-val">—</div>
+        <div class="kpi-sub" id="kpi-ad-contrib"></div>
+      </div>
+    </section>
+
+    <!-- Charts Row -->
+    <section class="charts-row">
+      <div class="chart-card chart-big">
+        <div class="chart-header">
+          <span class="chart-title">REVENUE TREND</span>
+          <span class="chart-badge">30 days</span>
+        </div>
+        <canvas id="revenueChart"></canvas>
+      </div>
+      <div class="chart-card chart-small">
+        <div class="chart-header">
+          <span class="chart-title">AD SPEND vs ATTRIBUTED SALES</span>
+          <span class="chart-badge">daily</span>
+        </div>
+        <canvas id="spendChart"></canvas>
+      </div>
+    </section>
+
+    <!-- Top Products Table -->
+    <section class="panel table-panel">
+      <h3 class="panel-title">TOP PRODUCTS BY REVENUE</h3>
+      <div id="top-products-table" class="table-placeholder">Upload data to view</div>
+    </section>
+
+    <!-- ─── AI Agent Section ───────────────────────────────────── -->
+    <section class="agent-section">
+      <div class="agent-header">
+        <span class="agent-title">AI INTELLIGENCE AGENT</span>
+        <span class="agent-model">llama3 via Ollama</span>
+      </div>
+
+      <div class="agent-input-row">
+        <textarea id="queryInput" class="query-input" rows="2"
+          placeholder="Ask anything: 'Which keywords are eating my budget?', 'Why did sales drop last week?'"></textarea>
+        <button class="btn-analyze" id="analyzeBtn" onclick="runQuery()">
+          <span id="analyze-label">ANALYZE</span>
+        </button>
+      </div>
+
+      <!-- Agent Response -->
+      <div id="agent-response" class="agent-response hidden">
+
+        <div class="response-section">
+          <div class="response-label">QUERY UNDERSTANDING</div>
+          <div id="res-understanding" class="response-text"></div>
+        </div>
+
+        <div class="response-section">
+          <div class="response-label">REASONING STEPS</div>
+          <ol id="res-steps" class="steps-list"></ol>
+        </div>
+
+        <div class="response-section">
+          <div class="response-label">KEY FINDINGS</div>
+          <div id="res-findings" class="findings-grid"></div>
+        </div>
+
+        <div class="response-section highlight-section">
+          <div class="response-label">CROSS-DATASET INSIGHT</div>
+          <div id="res-insight" class="insight-text"></div>
+        </div>
+
+        <div class="response-section">
+          <div class="response-label">RECOMMENDATIONS</div>
+          <div id="res-recommendations" class="recs-list"></div>
+        </div>
+
+        <div id="risk-section" class="response-section risk-section hidden">
+          <div class="response-label">⚠ RISK WARNINGS</div>
+          <div id="res-risks" class="risks-list"></div>
+        </div>
+
+      </div>
+
+      <div id="agent-loading" class="agent-loading hidden">
+        <div class="loading-spinner"></div>
+        <div class="loading-steps">
+          <div class="loading-step active" id="ls-1">📋 Parsing query…</div>
+          <div class="loading-step" id="ls-2">🔍 Running keyword analysis…</div>
+          <div class="loading-step" id="ls-3">📈 Analyzing sales trends…</div>
+          <div class="loading-step" id="ls-4">🔗 Cross-dataset reasoning…</div>
+          <div class="loading-step" id="ls-5">💡 Generating recommendations…</div>
+        </div>
+      </div>
+
+      <div id="agent-error" class="agent-error hidden"></div>
+    </section>
+
+  </div>
+</main>
+
+<script src="script.js"></script>
+</body>
+</html>
